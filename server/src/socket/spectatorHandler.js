@@ -1,0 +1,1 @@
+// Spectator mode handler

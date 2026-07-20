@@ -1,0 +1,1 @@
+// Department word generator
