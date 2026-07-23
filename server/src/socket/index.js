@@ -1,162 +1,65 @@
-// Socket.io initialization
-const { getIO } = require('../config/socket');
-const matchmakingService = require('../services/matchmakingService');
-const gameEngine = require('../services/gameEngine');
-const Match = require('../models/Match');
+// server/src/seeders/index.js
+const mongoose = require('mongoose');
+const connectDB = require('../config/database');
+const WordPool = require('../models/WordPool');
+const User = require('../models/User');
+const bcrypt = require('bcryptjs');
 
-module.exports = (io) => {
-  io.on('connection', (socket) => {
-    console.log(`👤 User connected: ${socket.id}`);
+const seedDatabase = async () => {
+  try {
+    await connectDB();
+    console.log('Starting database seeding...');
 
-    let userId = null;
+    // Clear existing data (optional)
+    // await WordPool.deleteMany({});
+    // await User.deleteMany({});
 
-    // Authenticate user
-    socket.on('authenticate', (data) => {
-      userId = data.userId;
-      socket.join(`user-${userId}`);
-      console.log(`User ${userId} authenticated`);
-      
-      // Send current queue status
-      socket.emit('queue-status', matchmakingService.getQueueStatus());
-    });
+    // Initialize word pools with hybrid generator
+    await WordPool.initializePools();
+    console.log('Word pools initialized');
 
-    // Join matchmaking queue
-    socket.on('join-queue', async (data) => {
-      if (!userId) {
-        socket.emit('error', { message: 'Not authenticated' });
-        return;
-      }
-
-      const result = await matchmakingService.addToQueue({
-        userId,
-        username: data.username,
-        department: data.department,
-        elo: data.elo
+    // Create admin user if doesn't exist
+    const adminExists = await User.findOne({ role: 'admin' });
+    if (!adminExists) {
+      const admin = new User({
+        username: 'admin',
+        email: process.env.ADMIN_EMAIL || 'admin@typefight.com',
+        password: process.env.ADMIN_PASSWORD || 'admin123',
+        department: 'common',
+        role: 'admin',
+        elo: 1500
       });
+      await admin.save();
+      console.log('Admin user created');
+    }
 
-      if (result.success) {
-        socket.emit('queue-update', { status: 'searching', queueSize: matchmakingService.queue.length });
-        // Broadcast updated queue status to all
-        io.emit('queue-status', matchmakingService.getQueueStatus());
-      } else {
-        socket.emit('error', { message: result.message });
-      }
-    });
+    // Create sample users for testing (optional)
+    const sampleUsers = [
+      { username: 'CS_Rahul', email: 'rahul@test.com', department: 'computer' },
+      { username: 'Civil_Anjali', email: 'anjali@test.com', department: 'civil' },
+      { username: 'Arch_Priya', email: 'priya@test.com', department: 'architecture' },
+      { username: 'Common_Dev', email: 'dev@test.com', department: 'common' }
+    ];
 
-    // Leave queue
-    socket.on('leave-queue', () => {
-      if (userId) {
-        matchmakingService.removeFromQueue(userId);
-        socket.emit('queue-update', { status: 'idle' });
-        io.emit('queue-status', matchmakingService.getQueueStatus());
-      }
-    });
-
-    // Handle typing
-    socket.on('typing', (data) => {
-      const { roomId, typed } = data;
-      if (!userId || !roomId) return;
-
-      const room = gameEngine.getRoom(roomId);
-      if (!room || room.status !== 'active') return;
-
-      // Check if it's this player's turn
-      if (!room.players[userId]) {
-        socket.emit('error', { message: 'Not in this game' });
-        return;
-      }
-
-      gameEngine.processTyping(roomId, userId, typed);
-    });
-
-    // Join spectator mode
-    socket.on('join-spectator', async (data) => {
-      const { roomId } = data;
-      socket.join(`spectator-${roomId}`);
-      
-      const room = gameEngine.getRoom(roomId);
-      if (room) {
-        socket.emit('spectator-state', {
-          roomId,
-          players: Object.keys(room.players).map(id => ({
-            userId: id,
-            username: room.players[id].username,
-            department: room.players[id].department,
-            health: room.players[id].health,
-            wpm: room.players[id].wpm || 0,
-            accuracy: room.players[id].accuracy || 100
-          })),
-          status: room.status,
-          currentWord: room.textPool[room.players[Object.keys(room.players)[0]]?.wordIndex || 0] || ''
+    for (const userData of sampleUsers) {
+      const exists = await User.findOne({ username: userData.username });
+      if (!exists) {
+        const user = new User({
+          ...userData,
+          password: 'password123',
+          elo: 1200 + Math.floor(Math.random() * 200)
         });
-      } else {
-        // Check if match is completed
-        const match = await Match.findOne({ roomId });
-        if (match && match.status === 'finished') {
-          socket.emit('match-completed', {
-            matchId: roomId,
-            winner: match.winner
-          });
-        } else {
-          socket.emit('error', { message: 'Match not found' });
-        }
+        await user.save();
+        console.log(`Sample user created: ${userData.username}`);
       }
-    });
+    }
 
-    // Leave spectator
-    socket.on('leave-spectator', (data) => {
-      const { roomId } = data;
-      socket.leave(`spectator-${roomId}`);
-    });
-
-    // Disconnect
-    socket.on('disconnect', () => {
-      console.log(`User disconnected: ${socket.id}`);
-      
-      if (userId) {
-        // Remove from queue if in it
-        matchmakingService.removeFromQueue(userId);
-        io.emit('queue-status', matchmakingService.getQueueStatus());
-
-        // Handle abandoned games
-        // Check if user is in any active game
-        for (const [roomId, room] of gameEngine.activeRooms) {
-          if (room.players[userId] && room.status === 'active') {
-            gameEngine.abandonRoom(roomId);
-            io.to(roomId).emit('game-abandoned', { 
-              message: `${room.players[userId].username} disconnected` 
-            });
-          }
-        }
-      }
-    });
-
-    // Reconnection
-    socket.on('reconnect-game', async (data) => {
-      const { roomId } = data;
-      if (!userId || !roomId) return;
-
-      const room = gameEngine.getRoom(roomId);
-      if (room && room.players[userId]) {
-        socket.join(roomId);
-        socket.emit('game-state', {
-          roomId,
-          status: room.status,
-          players: Object.keys(room.players).reduce((acc, id) => {
-            acc[id] = {
-              username: room.players[id].username,
-              health: room.players[id].health,
-              wpm: room.players[id].wpm || 0,
-              accuracy: room.players[id].accuracy || 100
-            };
-            return acc;
-          }, {})
-        });
-      } else {
-        socket.emit('error', { message: 'Game not found' });
-      }
-    });
-  });
-
-  return io;
+    console.log('Database seeding completed!');
+    process.exit(0);
+  } catch (error) {
+    console.error('Seeding error:', error);
+    process.exit(1);
+  }
 };
+
+seedDatabase();
