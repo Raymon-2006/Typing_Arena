@@ -1,6 +1,7 @@
+
 const socketIo = require('socket.io');
 
-let io;
+let io = null; 
 
 const initSocket = (server) => {
   io = socketIo(server, {
@@ -12,12 +13,14 @@ const initSocket = (server) => {
     pingTimeout: 60000,
     pingInterval: 25000
   });
+  console.log('✅ Socket.io initialized');
   return io;
 };
 
 const getIO = () => {
   if (!io) {
-    throw new Error('Socket.io not initialized!');
+    console.warn('⚠️ Socket.io not initialized yet, returning null');
+    return null; 
   }
   return io;
 };

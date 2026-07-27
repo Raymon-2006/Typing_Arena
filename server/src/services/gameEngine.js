@@ -1,3 +1,4 @@
+// server/src/services/gameEngine.js
 const { getIO } = require('../config/socket');
 const Match = require('../models/Match');
 const User = require('../models/User');
@@ -6,9 +7,27 @@ const WordPool = require('../models/WordPool');
 class GameEngine {
   constructor() {
     this.activeRooms = new Map();
-    this.io = getIO();
+    this.io = null;
   }
 
+  // ============================================================
+  // SOCKET SETUP
+  // ============================================================
+  setSocket(io) {
+    this.io = io;
+    console.log('✅ GameEngine socket set');
+  }
+
+  getSocket() {
+    if (!this.io) {
+      this.io = getIO();
+    }
+    return this.io;
+  }
+
+  // ============================================================
+  // ROOM MANAGEMENT
+  // ============================================================
   createRoom(matchId, player1, player2) {
     const room = {
       matchId,
@@ -25,7 +44,10 @@ class GameEngine {
           wrongWords: 0,
           startTime: null,
           totalTyped: 0,
-          totalCorrect: 0
+          totalCorrect: 0,
+          action: 'idle',
+          isAttacking: false,
+          lastActionTime: 0
         },
         [player2.userId]: {
           ...player2,
@@ -39,7 +61,10 @@ class GameEngine {
           wrongWords: 0,
           startTime: null,
           totalTyped: 0,
-          totalCorrect: 0
+          totalCorrect: 0,
+          action: 'idle',
+          isAttacking: false,
+          lastActionTime: 0
         }
       },
       textPool: [],
@@ -50,13 +75,35 @@ class GameEngine {
       timer: null,
       gameLoop: null,
       winner: null,
-      lastBroadcast: Date.now()
+      lastBroadcast: Date.now(),
+      soundQueue: []
     };
 
     this.activeRooms.set(matchId, room);
     return room;
   }
 
+  getRoom(matchId) {
+    return this.activeRooms.get(matchId);
+  }
+
+  isRoomActive(matchId) {
+    const room = this.activeRooms.get(matchId);
+    return room && room.status === 'active';
+  }
+
+  abandonRoom(matchId) {
+    const room = this.activeRooms.get(matchId);
+    if (room) {
+      if (room.gameLoop) clearInterval(room.gameLoop);
+      if (room.timer) clearTimeout(room.timer);
+      this.activeRooms.delete(matchId);
+    }
+  }
+
+  // ============================================================
+  // TEXT GENERATION
+  // ============================================================
   async generateTextPool(departments, totalSentences = 15) {
     try {
       const battleText = await WordPool.getBattleText(departments, 'medium', totalSentences);
@@ -81,6 +128,20 @@ class GameEngine {
     ];
   }
 
+  // ============================================================
+  // DAMAGE CALCULATION
+  // ============================================================
+  calculateDamage(player, word) {
+    const baseDamage = word.length * 1.5;
+    const comboBonus = Math.min(Math.floor(player.combo / 5) * 2, 10);
+    const accuracyBonus = player.accuracy > 90 ? 3 : 0;
+    
+    return Math.floor(Math.min(baseDamage + comboBonus + accuracyBonus, 25));
+  }
+
+  // ============================================================
+  // GAME FLOW
+  // ============================================================
   startGame(matchId) {
     const room = this.activeRooms.get(matchId);
     if (!room) throw new Error('Room not found');
@@ -88,16 +149,9 @@ class GameEngine {
     room.status = 'countdown';
     room.startTime = Date.now();
 
-    // Start countdown
     this.startCountdown(matchId);
-
-    // Start game loop (60 FPS)
     room.gameLoop = setInterval(() => this.updateGame(matchId), 1000 / 60);
-
-    // End game after duration
-    room.timer = setTimeout(() => {
-      this.endGame(matchId);
-    }, room.duration * 1000);
+    room.timer = setTimeout(() => this.endGame(matchId), room.duration * 1000);
   }
 
   startCountdown(matchId) {
@@ -107,12 +161,12 @@ class GameEngine {
     const interval = setInterval(() => {
       if (count > 0) {
         this.io.to(matchId).emit('countdown', { count });
+        this.emitSound(matchId, 'countdown', { count });
         count--;
       } else {
         clearInterval(interval);
         room.status = 'active';
         
-        // Set start times for players
         const playerIds = Object.keys(room.players);
         playerIds.forEach(id => {
           room.players[id].startTime = Date.now();
@@ -123,6 +177,8 @@ class GameEngine {
           duration: room.duration,
           totalWords: room.textPool.length
         });
+        
+        this.emitSound(matchId, 'fight');
       }
     }, 1000);
   }
@@ -135,30 +191,35 @@ class GameEngine {
     const playerIds = Object.keys(players);
     const now = Date.now();
 
-    // Calculate WPM and accuracy for each player
     playerIds.forEach(id => {
       const player = players[id];
       if (player.startTime) {
         const elapsed = (now - player.startTime) / 1000;
         const minutes = elapsed / 60;
         
-        // WPM: (correct words / minutes)
         player.wpm = minutes > 0 ? Math.round(player.correctWords / minutes) : 0;
-        
-        // Accuracy: (correct / total typed)
         player.accuracy = player.totalTyped > 0 
           ? Math.round((player.totalCorrect / player.totalTyped) * 100) 
           : 100;
       }
+
+      if (player.isAttacking && (now - player.lastActionTime) > 300) {
+        player.isAttacking = false;
+        if (player.action !== 'hit' && player.action !== 'victory' && player.action !== 'defeat') {
+          player.action = 'idle';
+        }
+      }
     });
 
-    // Broadcast game state every 100ms (not every frame)
     if (now - room.lastBroadcast > 100) {
       this.broadcastGameState(matchId);
       room.lastBroadcast = now;
     }
   }
 
+  // ============================================================
+  // TYPING PROCESSING
+  // ============================================================
   async processTyping(matchId, playerId, typedText) {
     const room = this.activeRooms.get(matchId);
     if (!room || room.status !== 'active') return;
@@ -172,7 +233,6 @@ class GameEngine {
 
     const currentWord = room.textPool[player.wordIndex];
     if (!currentWord) {
-      // No more words, generate more or end
       const newWords = await this.generateTextPool(
         [player.department, opponent.department],
         10
@@ -182,13 +242,11 @@ class GameEngine {
       return;
     }
 
-    // Normalize input
     const typed = typedText.trim().toLowerCase();
     const target = currentWord.toLowerCase();
 
-    // Check word completion
+    // --- CORRECT WORD ---
     if (typed === target) {
-      // Correct word!
       const damage = this.calculateDamage(player, currentWord);
       opponent.health = Math.max(0, opponent.health - damage);
       
@@ -198,30 +256,71 @@ class GameEngine {
       player.combo++;
       player.wordIndex++;
       player.typed = '';
-
-      // Update accuracy
       player.accuracy = player.totalTyped > 0 
         ? Math.round((player.totalCorrect / player.totalTyped) * 100) 
         : 100;
 
-      // Broadcast damage
+      // Fighter actions
+      player.action = 'punch';
+      player.isAttacking = true;
+      player.lastActionTime = Date.now();
+
+      opponent.action = 'hit';
+      opponent.isAttacking = true;
+      opponent.lastActionTime = Date.now();
+
+      // Emit events
+      this.io.to(matchId).emit('fighter-action', {
+        playerId: playerId,
+        action: 'punch',
+        opponentId: opponentId,
+        damage: damage,
+        combo: player.combo
+      });
+
+      this.io.to(matchId).emit('fighter-hit', {
+        playerId: opponentId,
+        damage: damage,
+        health: opponent.health
+      });
+
       this.io.to(matchId).emit('damage-dealt', {
         from: playerId,
         to: opponentId,
         damage,
         word: currentWord,
-        combo: player.combo
+        combo: player.combo,
+        health: opponent.health
       });
 
-      // Check if opponent is defeated
+      this.io.to(matchId).emit('hit-effect', {
+        x: opponent.x || 600,
+        y: opponent.y || 280,
+        damage: damage,
+        type: player.combo > 5 ? 'heavy' : 'normal'
+      });
+
+      this.io.to(matchId).emit('screen-shake', {
+        intensity: Math.min(4 + Math.floor(player.combo / 3), 10),
+        duration: 200 + (player.combo > 5 ? 100 : 0)
+      });
+
+      // Sounds
+      const punchSound = player.combo > 5 ? 'punch-heavy' : 'punch';
+      this.emitSound(matchId, punchSound, { damage, combo: player.combo });
+      this.emitSound(matchId, 'hit', { damage, health: opponent.health });
+      
+      if (player.combo > 1) {
+        this.emitSound(matchId, 'combo', { combo: player.combo });
+      }
+
       if (opponent.health <= 0) {
+        this.emitSound(matchId, 'victory');
         this.endGame(matchId, playerId);
         return;
       }
 
-      // Check if all words completed
       if (player.wordIndex >= room.textPool.length) {
-        // Generate more words
         const newWords = await this.generateTextPool(
           [player.department, opponent.department],
           10
@@ -230,30 +329,47 @@ class GameEngine {
         this.io.to(matchId).emit('new-words', { count: newWords.length });
       }
 
+    // --- WRONG CHARACTER ---
     } else if (typed.length > 0 && !target.startsWith(typed)) {
-      // Wrong character typed
       player.health = Math.max(0, player.health - 2);
       player.wrongWords++;
       player.combo = 0;
       player.totalTyped += 1;
 
-      // Broadcast typo
+      player.action = 'hit';
+      player.isAttacking = true;
+      player.lastActionTime = Date.now();
+
+      this.io.to(matchId).emit('fighter-action', {
+        playerId: playerId,
+        action: 'hit',
+        isTypo: true
+      });
+
+      this.emitSound(matchId, 'typo');
+      this.emitSound(matchId, 'damage-self', { health: player.health });
+
       this.io.to(matchId).emit('typo', {
         playerId,
-        wrongChar: typed[typed.length - 1]
+        wrongChar: typed[typed.length - 1],
+        health: player.health
+      });
+
+      this.io.to(matchId).emit('screen-shake', {
+        intensity: 2,
+        duration: 150
       });
 
       if (player.health <= 0) {
+        this.emitSound(matchId, 'defeat');
         this.endGame(matchId, opponentId);
         return;
       }
     }
 
-    // Update player's typed text
     player.typed = typed;
     player.totalTyped += 1;
 
-    // Broadcast typing progress
     this.io.to(matchId).emit('typing-progress', {
       playerId,
       typed,
@@ -262,14 +378,9 @@ class GameEngine {
     });
   }
 
-  calculateDamage(player, word) {
-    const baseDamage = word.length * 1.5;
-    const comboBonus = Math.min(Math.floor(player.combo / 5) * 2, 10);
-    const accuracyBonus = player.accuracy > 90 ? 3 : 0;
-    
-    return Math.floor(Math.min(baseDamage + comboBonus + accuracyBonus, 25));
-  }
-
+  // ============================================================
+  // BROADCAST
+  // ============================================================
   broadcastGameState(matchId) {
     const room = this.activeRooms.get(matchId);
     if (!room) return;
@@ -292,7 +403,9 @@ class GameEngine {
           accuracy: players[id].accuracy || 100,
           combo: players[id].combo || 0,
           correctWords: players[id].correctWords || 0,
-          progress: players[id].wordIndex / room.textPool.length
+          progress: players[id].wordIndex / room.textPool.length,
+          action: players[id].action || 'idle',
+          isAttacking: players[id].isAttacking || false
         };
         return acc;
       }, {}),
@@ -304,17 +417,29 @@ class GameEngine {
     this.io.to(matchId).emit('game-state', state);
   }
 
+  // ============================================================
+  // SOUND
+  // ============================================================
+  emitSound(matchId, soundType, data = {}) {
+    this.io.to(matchId).emit('play-sound', {
+      type: soundType,
+      timestamp: Date.now(),
+      ...data
+    });
+  }
+
+  // ============================================================
+  // GAME END
+  // ============================================================
   async endGame(matchId, winnerId = null) {
     const room = this.activeRooms.get(matchId);
     if (!room || room.status === 'finished') return;
 
-    // Stop game loop and timer
     if (room.gameLoop) clearInterval(room.gameLoop);
     if (room.timer) clearTimeout(room.timer);
 
     room.status = 'finished';
 
-    // Determine winner if not provided
     if (!winnerId) {
       const players = room.players;
       const playerIds = Object.keys(players);
@@ -324,13 +449,37 @@ class GameEngine {
       } else if (players[playerIds[1]].health > players[playerIds[0]].health) {
         winnerId = playerIds[1];
       } else {
-        // Draw - player with higher WPM wins
         winnerId = players[playerIds[0]].wpm > players[playerIds[1]].wpm ? 
           playerIds[0] : playerIds[1];
       }
     }
 
     room.winner = winnerId;
+
+    const playerIds = Object.keys(room.players);
+    playerIds.forEach(id => {
+      if (id === winnerId) {
+        room.players[id].action = 'victory';
+        this.emitSound(matchId, 'victory');
+      } else {
+        room.players[id].action = 'defeat';
+        this.emitSound(matchId, 'defeat');
+      }
+    });
+
+    // Fighter action for victory/defeat
+    this.io.to(matchId).emit('fighter-action', {
+      playerId: winnerId,
+      action: 'victory'
+    });
+
+    const loserId = playerIds.find(id => id !== winnerId);
+    if (loserId) {
+      this.io.to(matchId).emit('fighter-action', {
+        playerId: loserId,
+        action: 'defeat'
+      });
+    }
 
     // Broadcast final state
     this.io.to(matchId).emit('game-end', {
@@ -339,9 +488,10 @@ class GameEngine {
         username: room.players[winnerId].username,
         health: room.players[winnerId].health,
         wpm: room.players[winnerId].wpm,
-        accuracy: room.players[winnerId].accuracy
+        accuracy: room.players[winnerId].accuracy,
+        action: 'victory'
       },
-      players: Object.keys(room.players).map(id => ({
+      players: playerIds.map(id => ({
         userId: id,
         username: room.players[id].username,
         health: room.players[id].health,
@@ -349,19 +499,25 @@ class GameEngine {
         accuracy: room.players[id].accuracy,
         combo: room.players[id].combo,
         correctWords: room.players[id].correctWords,
-        wrongWords: room.players[id].wrongWords
+        wrongWords: room.players[id].wrongWords,
+        action: room.players[id].action || 'idle'
       }))
     });
 
-    // Save match results
+    setTimeout(() => {
+      this.emitSound(matchId, 'game-end', { winner: winnerId });
+    }, 500);
+
     await this.saveMatchResults(matchId);
 
-    // Clean up room after 30 seconds
     setTimeout(() => {
       this.activeRooms.delete(matchId);
     }, 30000);
   }
 
+  // ============================================================
+  // SAVE RESULTS
+  // ============================================================
   async saveMatchResults(matchId) {
     const room = this.activeRooms.get(matchId);
     if (!room) return;
@@ -373,7 +529,6 @@ class GameEngine {
       const players = room.players;
       const playerIds = Object.keys(players);
 
-      // Update player stats
       for (const id of playerIds) {
         const player = players[id];
         const user = await User.findById(id);
@@ -387,7 +542,6 @@ class GameEngine {
           });
           await user.save();
 
-          // Update match record
           const matchPlayer = match.players.find(p => p.userId.toString() === id);
           if (matchPlayer) {
             matchPlayer.wpm = player.wpm || 0;
@@ -400,7 +554,6 @@ class GameEngine {
         }
       }
 
-      // Set winner
       if (room.winner) {
         match.winner = room.winner;
       }
@@ -409,7 +562,6 @@ class GameEngine {
       match.endTime = new Date();
       await match.save();
 
-      // Broadcast to spectator rooms
       this.io.to(`spectator-${matchId}`).emit('match-completed', {
         matchId,
         winner: {
@@ -426,24 +578,6 @@ class GameEngine {
 
     } catch (error) {
       console.error('Error saving match results:', error);
-    }
-  }
-
-  getRoom(matchId) {
-    return this.activeRooms.get(matchId);
-  }
-
-  isRoomActive(matchId) {
-    const room = this.activeRooms.get(matchId);
-    return room && room.status === 'active';
-  }
-
-  abandonRoom(matchId) {
-    const room = this.activeRooms.get(matchId);
-    if (room) {
-      if (room.gameLoop) clearInterval(room.gameLoop);
-      if (room.timer) clearTimeout(room.timer);
-      this.activeRooms.delete(matchId);
     }
   }
 }
